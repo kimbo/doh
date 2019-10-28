@@ -19,8 +19,7 @@ void my_audio_callback(void *userdata, Uint8 *stream, int len)
 	}
 
 	len = ((unsigned)len > audio_len ? (int)audio_len : len);
-	// SDL_memcpy(stream, audio_pos, len);
-	SDL_MixAudio(stream, audio_pos, len, SDL_MIX_MAXVOLUME);// mix from one buffer into another
+	SDL_memcpy(stream, audio_pos, len);
 
 	audio_pos += len;
 	audio_len -= len;
