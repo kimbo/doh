@@ -74,6 +74,7 @@ static int playing = false;
 #define DNS_TYPE_A     1
 #define DNS_TYPE_NS    2
 #define DNS_TYPE_CNAME 5
+#define DNS_TYPE_TXT   16
 #define DNS_TYPE_AAAA  28
 
 #define MAX_ADDR 8
@@ -206,6 +207,11 @@ struct cnamestore {
   size_t allocsize; /* allocated size */
 };
 
+struct txtstore {
+  int len;
+  char txt[255];
+};
+
 struct dnsentry {
   unsigned int ttl;
   int numv4;
@@ -214,11 +220,20 @@ struct dnsentry {
   struct addr6 v6addr[MAX_ADDR];
   int numcname;
   struct cnamestore cname[MAX_ADDR];
+  int numtxt;
+  struct txtstore txt[MAX_ADDR];
 };
 
 static const char *type2name(int dnstype)
 {
-  return (dnstype == 1)?"A":"AAAA";
+  switch(dnstype) {
+  case DNS_TYPE_A: return "A";
+  case DNS_TYPE_NS: return "NS";
+  case DNS_TYPE_CNAME: return "CNAME";
+  case DNS_TYPE_TXT: return "TXT";
+  case DNS_TYPE_AAAA: return "AAAA";
+  }
+  return "Unknown";
 }
 
 static size_t
@@ -276,7 +291,7 @@ static size_t doh_encode(const char *host,
     }
     else
       labellen = strlen(hostp);
-    if (labellen > 63)
+    if(labellen > 63)
       /* too long label, error out */
       return DOH_DNS_BAD_LABEL;
     *dnsp++ = (unsigned char)labellen;
@@ -302,19 +317,19 @@ static DOHcode skipqname(unsigned char *doh, size_t dohlen,
 {
   unsigned char length;
   do {
-    if (dohlen < (*indexp + 1))
+    if(dohlen < (*indexp + 1))
       return DOH_DNS_OUT_OF_RANGE;
     length = doh[*indexp];
-    if ((length & 0xc0) == 0xc0) {
+    if((length & 0xc0) == 0xc0) {
       /* name pointer, advance over it and be done */
-      if (dohlen < (*indexp + 2))
+      if(dohlen < (*indexp + 2))
         return DOH_DNS_OUT_OF_RANGE;
       *indexp += 2;
       break;
     }
-    if (length & 0xc0)
+    if(length & 0xc0)
       return DOH_DNS_BAD_LABEL;
-    if (dohlen < (*indexp + 1 + length))
+    if(dohlen < (*indexp + 1 + length))
       return DOH_DNS_OUT_OF_RANGE;
     *indexp += 1 + length;
   } while (length);
@@ -372,6 +387,7 @@ static DOHcode cnameappend(struct cnamestore *c,
     ptr = realloc(c->alloc, c->allocsize);
     if(!ptr) {
       free(c->alloc);
+      c->alloc = NULL;
       return DOH_OUT_OF_MEM;
     }
     c->alloc = ptr;
@@ -391,13 +407,13 @@ static DOHcode store_cname(unsigned char *doh,
   unsigned int loop = 128; /* a valid DNS name can never loop this much */
   unsigned char length;
   do {
-    if (index >= dohlen)
+    if(index >= dohlen)
       return DOH_DNS_OUT_OF_RANGE;
     length = doh[index];
-    if ((length & 0xc0) == 0xc0) {
+    if((length & 0xc0) == 0xc0) {
       unsigned short newpos;
       /* name pointer, get the new offset (14 bits) */
-      if ((index +1) >= dohlen)
+      if((index + 1) >= dohlen)
         return DOH_DNS_OUT_OF_RANGE;
 
       /* move to the the new index */
@@ -405,19 +421,19 @@ static DOHcode store_cname(unsigned char *doh,
       index = newpos;
       continue;
     }
-    else if (length & 0xc0)
+    else if(length & 0xc0)
       return DOH_DNS_BAD_LABEL; /* bad input */
     else
       index++;
 
-    if (length) {
+    if(length) {
       DOHcode rc;
-      if (c->len) {
+      if(c->len) {
         rc = cnameappend(c, (unsigned char *)".", 1);
         if(rc)
           return rc;
       }
-      if ((index + length) > dohlen)
+      if((index + length) > dohlen)
         return DOH_DNS_BAD_LABEL;
 
       rc = cnameappend(c, &doh[index], length);
@@ -427,8 +443,32 @@ static DOHcode store_cname(unsigned char *doh,
     }
   } while (length && --loop);
 
-  if (!loop)
+  if(!loop)
     return DOH_DNS_CNAME_LOOP;
+  return DOH_OK;
+}
+
+static DOHcode store_txt(unsigned char *doh,
+                         size_t dohlen,
+                         int rdlength,
+                         unsigned int index,
+                         struct dnsentry *d)
+{
+  if(d->numtxt < MAX_ADDR) {
+    struct txtstore *t = &d->txt[d->numtxt++];
+    unsigned char length = 0;
+
+    if(index >= dohlen || (index + 1) >= dohlen)
+      return DOH_DNS_OUT_OF_RANGE;
+
+    length = doh[index++];
+    if(length) {
+      t->len = rdlength - 1;
+      memcpy(t->txt, &doh[index], t->len);
+      t->txt[t->len] = 0;
+    }
+  }
+
   return DOH_OK;
 }
 
@@ -454,7 +494,7 @@ static DOHcode rdata(unsigned char *doh,
       return rc;
     break;
   case DNS_TYPE_AAAA:
-    if (rdlength != 16)
+    if(rdlength != 16)
       return DOH_DNS_RDATA_LEN;
     rc = store_aaaa(doh, index, d);
     if(rc)
@@ -462,6 +502,13 @@ static DOHcode rdata(unsigned char *doh,
     break;
   case DNS_TYPE_CNAME:
     rc = store_cname(doh, dohlen, index, d);
+    if(rc)
+      return rc;
+    break;
+  case DNS_TYPE_TXT:
+    if(rdlength <= 1)
+      return DOH_DNS_RDATA_LEN;
+    rc = store_txt(doh, dohlen, rdlength, index, d);
     if(rc)
       return rc;
     break;
@@ -501,7 +548,7 @@ static DOHcode doh_decode(unsigned char *doh,
     rc = skipqname(doh, dohlen, &index);
     if(rc)
       return rc; /* bad qname */
-    if (dohlen < (index + 4))
+    if(dohlen < (index + 4))
       return DOH_DNS_OUT_OF_RANGE;
     index += 4; /* skip question's type and class */
     qdcount--;
@@ -515,23 +562,23 @@ static DOHcode doh_decode(unsigned char *doh,
     if(rc)
       return rc; /* bad qname */
 
-    if (dohlen < (index + 2))
+    if(dohlen < (index + 2))
       return DOH_DNS_OUT_OF_RANGE;
 
     type = get16bit(doh, index);
-    if ((type != DNS_TYPE_CNAME) && (type != dnstype))
+    if((type != DNS_TYPE_CNAME) && (type != dnstype))
       /* Not the same type as was asked for nor CNAME */
       return DOH_DNS_UNEXPECTED_TYPE;
     index += 2;
 
-    if (dohlen < (index + 2))
+    if(dohlen < (index + 2))
       return DOH_DNS_OUT_OF_RANGE;
     class = get16bit(doh, index);
-    if (DNS_CLASS_IN != class)
+    if(DNS_CLASS_IN != class)
       return DOH_DNS_UNEXPECTED_CLASS; /* unsupported */
     index += 2;
 
-    if (dohlen < (index + 4))
+    if(dohlen < (index + 4))
       return DOH_DNS_OUT_OF_RANGE;
 
     ttl = get32bit(doh, index);
@@ -539,7 +586,7 @@ static DOHcode doh_decode(unsigned char *doh,
       d->ttl = ttl;
     index += 4;
 
-    if (dohlen < (index + 2))
+    if(dohlen < (index + 2))
       return DOH_DNS_OUT_OF_RANGE;
 
     rdlength = get16bit(doh, index);
@@ -560,19 +607,19 @@ static DOHcode doh_decode(unsigned char *doh,
     if(rc)
       return rc; /* bad qname */
 
-    if (dohlen < (index + 8))
+    if(dohlen < (index + 8))
       return DOH_DNS_OUT_OF_RANGE;
 
     index += 2; /* type */
     index += 2; /* class */
     index += 4; /* ttl */
 
-    if (dohlen < (index + 2))
+    if(dohlen < (index + 2))
       return DOH_DNS_OUT_OF_RANGE;
 
     rdlength = get16bit(doh, index);
     index += 2;
-    if (dohlen < (index + rdlength))
+    if(dohlen < (index + rdlength))
       return DOH_DNS_OUT_OF_RANGE;
     index += rdlength;
     nscount--;
@@ -584,7 +631,7 @@ static DOHcode doh_decode(unsigned char *doh,
     if(rc)
       return rc; /* bad qname */
 
-    if (dohlen < (index + 8))
+    if(dohlen < (index + 8))
       return DOH_DNS_OUT_OF_RANGE;
 
     index += 2; /* type */
@@ -593,16 +640,16 @@ static DOHcode doh_decode(unsigned char *doh,
 
     rdlength = get16bit(doh, index);
     index += 2;
-    if (dohlen < (index + rdlength))
+    if(dohlen < (index + rdlength))
       return DOH_DNS_OUT_OF_RANGE;
     index += rdlength;
     arcount--;
   }
 
-  if (index != dohlen)
+  if(index != dohlen)
     return DOH_DNS_MALFORMAT; /* something is wrong */
 
-  if ((type != DNS_TYPE_NS) && !d->numcname && !d->numv6 && !d->numv4)
+  if((type != DNS_TYPE_NS) && !d->numcname && !d->numv6 && !d->numv4 && !d->numtxt)
     /* nothing stored! */
     return DOH_NO_CONTENT;
 
@@ -677,11 +724,11 @@ static int initprobe(int dnstype, char *host, const char *url, CURLM *multi,
       curl_easy_setopt(curl, CURLOPT_DEBUGDATA, &p->config);
       curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
     }
-    if (transport == v4)
+    if(transport == v4)
       curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
-    else if (transport == v6)
+    else if(transport == v6)
       curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V6);
-    if (resolve != NULL)
+    if(resolve != NULL)
       curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve);
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
@@ -728,11 +775,13 @@ static void help(const char *msg)
 #ifdef HAS_SOUND
 	"  -s  play doh sound\n"
 #endif
-        "  -t  test mode\n"
+        "  -tTYPE (e.g., TXT, CNAME, A, AAAA)\n"
+        "      (to specify record type)\n"
+        "  -T  test mode\n"
         "  -v  verbose mode\n"
         "  -4  use only IPv4 transport\n"
         "  -6  use only IPv6 transport\n"
-        "  -rNAME:PORT:ADDRESS (e.g., example.com:443:127.0.0.1\n"
+        "  -rNAME:PORT:ADDRESS (e.g., example.com:443:127.0.0.1)\n"
         "      (to preload libcurl's DNS cache)\n"
         "  -V  show version\n"
         "(default URL is %s)\n",
@@ -765,6 +814,7 @@ int main(int argc, char **argv)
   int successful = 0;
   int exit_status = 0;
   int queued;
+  int query_type = 0; /* 0 default value outputs A, AAAA, CNAME */
   bool insecure_mode = false;
 
   for(argc--, argv++; argc > 0 && argv[0][0] == '-'; argc--, argv++) {
@@ -775,7 +825,19 @@ int main(int argc, char **argv)
     case 'V': /* version */
       show_version();
       break;
-    case 't': /* test mode */
+    case 't':
+      if(!strcmp(&argv[0][2], "AAAA"))
+        query_type = DNS_TYPE_AAAA;
+      else if(!strcmp(&argv[0][2], "A"))
+        query_type = DNS_TYPE_A;
+      else if(!strcmp(&argv[0][2], "CNAME"))
+        query_type = DNS_TYPE_CNAME;
+      else if(!strcmp(&argv[0][2], "TXT"))
+        query_type = DNS_TYPE_TXT;
+      else
+        help("type not supported");
+      break;
+    case 'T': /* test mode */
       test_mode = 1;
       break;
     case 'k': /* insecure */
@@ -835,21 +897,39 @@ int main(int argc, char **argv)
   doh_init(&d);
 
   for(i = 0; i < n_urls; i++) {
-    if(transport == v4 || transport == v46) {
+    if(query_type == 0 || query_type == DNS_TYPE_A) {
       rc = initprobe(DNS_TYPE_A, host, urls[i], multi,
                      trace_enabled, headers, insecure_mode,
                      transport, resolve);
       if(rc != 0) {
-        fprintf(stderr, "initprobe() failed (v4)\n");
+        fprintf(stderr, "initprobe() failed (DNS_TYPE_A)\n");
         exit(1);
       }
     }
-    if(transport == v6 || transport == v46) {
+    if(query_type == 0 || query_type == DNS_TYPE_AAAA) {
       rc = initprobe(DNS_TYPE_AAAA, host, urls[i], multi,
                      trace_enabled, headers, insecure_mode,
                      transport, resolve);
       if(rc != 0) {
-        fprintf(stderr, "initprobe() failed (v6)\n");
+        fprintf(stderr, "initprobe() failed (DNS_TYPE_AAAA)\n");
+        exit(1);
+      }
+    }
+    if(query_type == DNS_TYPE_TXT) {
+      rc = initprobe(DNS_TYPE_TXT, host, urls[i], multi,
+                     trace_enabled, headers, insecure_mode,
+                     transport, resolve);
+      if(rc != 0) {
+        fprintf(stderr, "initprobe() failed (DNS_TYPE_TXT)\n");
+        exit(1);
+      }
+    }
+    if(query_type == DNS_TYPE_CNAME) {
+      rc = initprobe(DNS_TYPE_CNAME, host, urls[i], multi,
+                     trace_enabled, headers, insecure_mode,
+                     transport, resolve);
+      if(rc != 0) {
+        fprintf(stderr, "initprobe() failed (DNS_TYPE_CNAME)\n");
         exit(1);
       }
     }
@@ -938,24 +1018,34 @@ int main(int argc, char **argv)
     int i;
     printf("[%s]\n", host);
     printf("TTL: %u seconds\n", d.ttl);
-    for(i=0; i < d.numv4; i++) {
-      printf("A: %d.%d.%d.%d\n",
-             d.v4addr[i]>>24,
-             (d.v4addr[i]>>16) & 0xff,
-             (d.v4addr[i]>>8) & 0xff,
-             d.v4addr[i] & 0xff);
-    }
-    for(i=0; i < d.numv6; i++) {
-      int j;
-      printf("AAAA: ");
-      for(j=0; j<16; j+=2) {
-        printf("%s%02x%02x", j ? ":" : "", d.v6addr[i].byte[j],
-               d.v6addr[i].byte[j+1]);
+    if(query_type == 0 || query_type == DNS_TYPE_A) {
+      for(i=0; i < d.numv4; i++) {
+        printf("A: %d.%d.%d.%d\n",
+               d.v4addr[i]>>24,
+               (d.v4addr[i]>>16) & 0xff,
+               (d.v4addr[i]>>8) & 0xff,
+               d.v4addr[i] & 0xff);
       }
-      printf("\n");
     }
-    for(i=0; i < d.numcname; i++)
-      printf("CNAME: %s\n", d.cname[i].alloc);
+    if(query_type == 0 || query_type == DNS_TYPE_AAAA) {
+      for(i=0; i < d.numv6; i++) {
+        int j;
+        printf("AAAA: ");
+        for(j=0; j<16; j+=2) {
+          printf("%s%02x%02x", j ? ":" : "", d.v6addr[i].byte[j],
+                 d.v6addr[i].byte[j+1]);
+        }
+        printf("\n");
+      }
+    }
+    if(query_type == 0 || query_type == DNS_TYPE_CNAME) {
+      for(i=0; i < d.numcname; i++)
+        printf("CNAME: %s\n", d.cname[i].alloc);
+    }
+    if(query_type == 0 || query_type == DNS_TYPE_TXT) {
+      for(i=0; i < d.numtxt; i++)
+        printf("TXT: %s\n", d.txt[i].txt);
+    }
   }
 
 #ifdef HAS_SOUND
@@ -965,9 +1055,9 @@ int main(int argc, char **argv)
 #endif
 
   doh_cleanup(&d);
-  if (headers != NULL)
+  if(headers != NULL)
     curl_slist_free_all(headers);
-  if (resolve != NULL)
+  if(resolve != NULL)
     curl_slist_free_all(resolve);
   curl_multi_cleanup(multi);
 
